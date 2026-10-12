@@ -1,0 +1,22 @@
+eval:
+  task: gsm8k
+  ckpt_path: models/LLaDA-8B-Instruct
+  model_family: llada
+  output: outputs/eval/justgrpo-llada-gsm8k
+  gen_length:
+  - 128
+  - 256
+  - 512
+  seed: 113
+  temperature: 0.0
+  allow_remote_files: false
+  gsm8k_data_files: datasets/gsm8k/main/test-*.parquet
+  generation_method: diffusion
+  block_length: 32
+  mtp_size:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  report_diffusion_mtp_like_stats: true

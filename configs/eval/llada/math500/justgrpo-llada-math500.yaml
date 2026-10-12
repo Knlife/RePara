@@ -1,0 +1,22 @@
+eval:
+  task: math500
+  ckpt_path: models/LLaDA-8B-Instruct
+  model_family: llada
+  output: outputs/eval/justgrpo-llada-math500
+  gen_length:
+  - 128
+  - 256
+  - 512
+  seed: 113
+  temperature: 0.0
+  allow_remote_files: false
+  math500_data_files: datasets/math500/test-*.parquet
+  generation_method: diffusion
+  block_length: 32
+  mtp_size:
+  - 1
+  - 2
+  - 4
+  - 8
+  - 16
+  report_diffusion_mtp_like_stats: true

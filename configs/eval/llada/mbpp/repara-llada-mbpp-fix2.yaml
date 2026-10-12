@@ -1,0 +1,19 @@
+eval:
+  task: mbpp
+  ckpt_path: models/LLaDA-8B-Instruct
+  model_family: llada
+  output: outputs/eval/repara-llada-mbpp-fix2
+  gen_length:
+  - 128
+  - 256
+  - 512
+  seed: 113
+  temperature: 0.0
+  allow_remote_files: false
+  mbpp_data_file: datasets/mbpp/mbpp.jsonl
+  mbpp_test_file: datasets/mbpp/mbpp_test.jsonl
+  generation_method: fixed_mtp
+  mtp_block_size: 2
+  mtp_confidence: normalized_entropy
+  mtp_threshold: 0.95
+  selective_logits: true
