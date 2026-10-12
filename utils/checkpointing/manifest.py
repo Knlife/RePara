@@ -27,7 +27,7 @@ TRAINING_SOURCE_FILES = (
     "utils/runtime/rng.py",
     "utils/runtime/distributed.py",
     "utils/checkpointing/checkpoint.py",
-
+    "utils/models/sdar_config.py",
     "utils/models/model_paths.py",
     "data/sampler.py",
 )

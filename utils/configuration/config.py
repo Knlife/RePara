@@ -14,14 +14,19 @@ import yaml
 
 
 ACTIVATION_CHECKPOINTING_STRATEGIES = ("whole_layer", "none")
-_MODEL_FAMILIES = ("llada", )
+_MODEL_FAMILIES = ("llada", "sdar")
 _MTP_METHODS = ("fixed_mtp", "ar_mtp")
 _TRAIN_METHODS = ("justgrpo", *_MTP_METHODS)
 _TRAIN_SCHEDULE_FIELDS = {"start_step", "method", "block_size"}
-_EVAL_GENERATION_METHODS = ("diffusion", *_MTP_METHODS, )
-_ONLINE_EVAL_GENERATION_METHODS = ("diffusion", *_MTP_METHODS, )
+_EVAL_GENERATION_METHODS = ("diffusion", *_MTP_METHODS, "sdar_native")
+_ONLINE_EVAL_GENERATION_METHODS = ("diffusion", *_MTP_METHODS, "sdar_native")
 _MTP_CONFIDENCE_METRICS = ("normalized_entropy", "max_probability")
-
+_SDAR_REMASKING_STRATEGIES = (
+    "low_confidence_dynamic",
+    "low_confidence_static",
+    "sequential",
+    "entropy_bounded",
+)
 _TRAIN_DATA_PATH_FIELDS = {
     "gsm8k": "gsm8k_data_path",
     "math": "math_data_path",
@@ -52,16 +57,16 @@ ONLINE_EVAL_FIELDS = (
     "mbpp_data_file",
     "mbpp_test_file",
     "code_data_file",
-
-
-
-
-
-
-
-
-
-
+    "sdar_block_length",
+    "sdar_native_block_size",
+    "sdar_denoising_steps",
+    "sdar_remasking_strategy",
+    "sdar_confidence_threshold",
+    "sdar_eb_threshold",
+    "sdar_temperature",
+    "sdar_top_k",
+    "sdar_top_p",
+    "sdar_stopping_criteria_idx",
     "batch_size",
     "mtp_like_prefix_size",
     "report_diffusion_mtp_like_stats",
@@ -325,7 +330,7 @@ class TrainConfig:
     model_family: str = "llada"
     mask_id: Optional[int] = None
     # Model-native attention/KV-cache block size, independent of RePara's MTP size.
-
+    sdar_native_block_size: Optional[int] = None
 
     batch_size_per_device: int = 1
     grad_accumulation: int = 8
@@ -435,14 +440,29 @@ class TrainConfig:
             raise ValueError(f"Unknown model family: {self.model_family}")
         if self.method not in _TRAIN_METHODS:
             raise ValueError(f"Unknown training method: {self.method}")
-
+        if self.sdar_native_block_size is not None:
+            if self.model_family != "sdar":
+                raise ValueError("sdar_native_block_size requires model_family=sdar")
+            if (
+                isinstance(self.sdar_native_block_size, bool)
+                or not isinstance(self.sdar_native_block_size, int)
+                or self.sdar_native_block_size < 1
+            ):
+                raise ValueError("sdar_native_block_size must be a positive integer")
+            if self.method in _MTP_METHODS and self.mtp_block_size > self.sdar_native_block_size:
+                raise ValueError("mtp_block_size must not exceed sdar_native_block_size")
         if not 1 <= self.mtp_block_size <= self.gen_length:
             raise ValueError("mtp_block_size must be in [1, gen_length]")
         if self.train_schedule is None:
             scheduled_methods = {self.method}
         else:
             scheduled_methods = {stage.method for stage in self.resolved_train_schedule()}
-
+        if self.sdar_native_block_size is not None and any(
+            stage.method in _MTP_METHODS
+            and stage.block_size > self.sdar_native_block_size
+            for stage in self.resolved_train_schedule()
+        ):
+            raise ValueError("Scheduled MTP block_size must not exceed sdar_native_block_size")
         if scheduled_methods & set(_MTP_METHODS) and self.gen_steps != self.gen_length:
             raise ValueError("MTP methods require gen_steps == gen_length")
         if "justgrpo" in scheduled_methods and self.gen_steps % self.gen_length != 0:
@@ -462,9 +482,9 @@ class TrainConfig:
             or self.format_reward_alpha < 0
         ):
             raise ValueError("format_reward_alpha must be finite and non-negative")
-        if self.selective_logits and self.model_family not in ("llada", ):
+        if self.selective_logits and self.model_family not in ("llada", "sdar"):
             raise ValueError(
-                'LLaDA model and evaluation support.'
+                "selective_logits currently supports model_family=llada/sdar only"
             )
         if (
             self.activation_checkpointing_strategy
@@ -495,7 +515,11 @@ class TrainConfig:
                 resolve_online_eval_config(self)
             else:
                 spec = resolve_online_eval_config(self)
-
+                if spec["generation_method"] == "sdar_native":
+                    raise ValueError(
+                        "Native SDAR online code evaluation requires checkpoint replicas; "
+                        "run standalone evaluation instead"
+                    )
                 _validate_online_eval(
                     spec, model_family=self.model_family,
                 )
@@ -513,7 +537,7 @@ class EvalConfig:
     ckpt_path: str = ""
     model_family: str = "llada"
     mask_id: Optional[int] = None
-
+    sdar_native_block_size: Optional[int] = None
     gsm8k_data_files: str = ""
     math500_data_files: str = ""
     humaneval_data_file: str = ""
@@ -535,15 +559,15 @@ class EvalConfig:
     selective_logits: bool = False
     mtp_like_prefix_size: int = 2
     report_diffusion_mtp_like_stats: bool = False
-
-
-
-
-
-
-
-
-
+    sdar_block_length: int = 4
+    sdar_denoising_steps: int = 4
+    sdar_remasking_strategy: str = "low_confidence_dynamic"
+    sdar_confidence_threshold: float = 0.85
+    sdar_eb_threshold: float = 0.35
+    sdar_temperature: float = 1.0
+    sdar_top_k: int = 0
+    sdar_top_p: float = 1.0
+    sdar_stopping_criteria_idx: Optional[list[int]] = None
 
     def validate(self) -> None:
         _validate_environment(self, "eval")
@@ -557,7 +581,19 @@ class EvalConfig:
         _require_fields(self, "eval", required_fields)
         if self.model_family not in _MODEL_FAMILIES:
             raise ValueError(f"Unknown model family: {self.model_family}")
-
+        if self.sdar_native_block_size is not None:
+            if self.model_family != "sdar":
+                raise ValueError("sdar_native_block_size requires model_family=sdar")
+            if (
+                isinstance(self.sdar_native_block_size, bool)
+                or not isinstance(self.sdar_native_block_size, int)
+                or self.sdar_native_block_size < 1
+            ):
+                raise ValueError("sdar_native_block_size must be a positive integer")
+            if self.generation_method in _MTP_METHODS and self.mtp_block_size > self.sdar_native_block_size:
+                raise ValueError("mtp_block_size must not exceed sdar_native_block_size")
+            if self.generation_method == "sdar_native" and self.sdar_block_length != self.sdar_native_block_size:
+                raise ValueError("sdar_block_length must match sdar_native_block_size")
         if self.generation_method not in _EVAL_GENERATION_METHODS:
             raise ValueError(
                 f"Unknown generation method: {self.generation_method}"
@@ -566,25 +602,33 @@ class EvalConfig:
             raise ValueError(
                 f"Unknown MTP confidence metric: {self.mtp_confidence}"
             )
-
+        if self.sdar_remasking_strategy not in _SDAR_REMASKING_STRATEGIES:
+            raise ValueError(
+                "Unknown SDAR remasking strategy: "
+                f"{self.sdar_remasking_strategy}"
+            )
         if isinstance(self.batch_size, bool) or self.batch_size != 1:
             raise ValueError("RePara evaluation requires batch_size=1")
-        for name in ("temperature", ):
+        for name in ("temperature", "sdar_temperature"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(float(value)) or value < 0:
                 raise ValueError(f"{name} must be finite and non-negative")
-        for name in ("block_length", "mtp_block_size", "mtp_like_prefix_size",  ):
+        for name in ("block_length", "mtp_block_size", "mtp_like_prefix_size", "sdar_block_length", "sdar_denoising_steps"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
                 raise ValueError(f"{name} must be a positive integer")
-        for name in ("mtp_threshold",  ):
+        for name in ("mtp_threshold", "sdar_confidence_threshold", "sdar_eb_threshold"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, Real) or not isfinite(float(value)) or not 0 <= value <= 1:
                 raise ValueError(f"{name} must be a finite number in [0, 1]")
-
-        if self.selective_logits and self.model_family not in ("llada", ):
+        if self.generation_method == "sdar_native":
+            if self.model_family != "sdar":
+                raise ValueError("sdar_native evaluation requires model_family=sdar")
+            if self.sdar_denoising_steps > self.sdar_block_length:
+                raise ValueError("sdar_denoising_steps cannot exceed sdar_block_length")
+        if self.selective_logits and self.model_family not in ("llada", "sdar"):
             raise ValueError(
-                'LLaDA model and evaluation support.'
+                "selective_logits currently supports model_family=llada/sdar only"
             )
         if self.selective_logits and self.generation_method not in _MTP_METHODS:
             raise ValueError(
@@ -628,7 +672,7 @@ def resolve_online_eval_config(config: TrainConfig) -> dict:
             "mtp_block_size": config.mtp_block_size,
             "mtp_confidence": config.mtp_confidence,
             "mtp_threshold": config.mtp_threshold,
-
+            "sdar_native_block_size": config.sdar_native_block_size,
         }
     )
     resolved.update(dict(config.eval_config))
@@ -643,13 +687,17 @@ def resolve_online_eval_config(config: TrainConfig) -> dict:
 
 
 def _resolve_math_online_eval_config(config: TrainConfig) -> dict:
-    'LLaDA model and evaluation support.'
+    """Resolve the train-monitor eval spec, extended to SDAR and rate sweeps.
+
+    Ported selectively from origin/feat/train-monitor (c0101b9). For SDAR,
+    mtp_size denotes the nominal rate: denoising_steps = native block / rate.
+    """
     if not isinstance(config.eval_config, Mapping):
         raise ValueError("eval_config is required and must be a mapping")
     if config.dataset not in ("gsm8k", "math"):
         raise ValueError("Online checkpoint evaluation currently supports gsm8k/math training")
     task = "math500" if config.dataset == "math" else "gsm8k"
-    excluded = {"task", "ckpt_path", "model_family", "mask_id", "output", }
+    excluded = {"task", "ckpt_path", "model_family", "mask_id", "output", "sdar_denoising_steps"}
     defaults = EvalConfig()
     allowed = {field.name for field in fields(EvalConfig)} - excluded
     unknown = set(config.eval_config) - allowed - {"tasks", "output_dir"}
@@ -659,20 +707,20 @@ def _resolve_math_online_eval_config(config: TrainConfig) -> dict:
     spec.update(
         tasks=[task], output_dir=str(Path(config.output_dir) / "online-eval"),
         gen_length=config.gen_length, mtp_size=[1, 2, 4],
-        generation_method="diffusion",
-
-
-
+        generation_method="sdar_native" if config.model_family == "sdar" else "diffusion",
+        sdar_temperature=0.0,
+        sdar_native_block_size=config.sdar_native_block_size,
+        sdar_block_length=config.sdar_native_block_size or 4,
     )
     spec.update(config.eval_config)
     if spec["tasks"] != [task]:
         raise ValueError(f"eval_config.tasks must be [{task!r}] for dataset={config.dataset}")
     if not isinstance(spec["output_dir"], str) or not spec["output_dir"].strip():
         raise ValueError("eval_config.output_dir must be a non-empty path string")
-    expected_method = "diffusion"
+    expected_method = "sdar_native" if config.model_family == "sdar" else "diffusion"
     if spec["generation_method"] != expected_method:
         raise ValueError(f"Online {config.model_family} evaluation requires {expected_method}")
-    for key in ("gen_length", "block_length", ):
+    for key in ("gen_length", "block_length", "sdar_block_length"):
         if isinstance(spec[key], bool) or not isinstance(spec[key], int) or spec[key] <= 0:
             raise ValueError(f"eval_config.{key} must be a positive integer")
     rates = spec["mtp_size"]
@@ -686,14 +734,14 @@ def _resolve_math_online_eval_config(config: TrainConfig) -> dict:
         raise ValueError("eval_config.seed must be a non-negative integer")
     if spec["batch_size"] != 1 or isinstance(spec["batch_size"], bool):
         raise ValueError("Online evaluation requires batch_size=1")
-    if False or spec["temperature"] != 0:
+    if spec["sdar_temperature"] != 0 or spec["temperature"] != 0:
         raise ValueError("Online math evaluation uses temperature=0")
     if spec["selective_logits"] or spec["allow_remote_files"]:
         raise ValueError("Online diffusion evaluation requires local files and selective_logits=false")
-    for key in ( ):
+    for key in ("sdar_confidence_threshold", "sdar_eb_threshold"):
         if isinstance(spec[key], bool) or not isinstance(spec[key], (int, float)) or not 0 <= spec[key] <= 1:
             raise ValueError(f"eval_config.{key} must be a number in [0, 1]")
-    block = spec["block_length"]
+    block = spec["sdar_block_length"] if config.model_family == "sdar" else spec["block_length"]
     if spec["gen_length"] % block:
         raise ValueError("eval_config.gen_length must be divisible by the decoding block length")
     for rate in rates:
@@ -704,7 +752,7 @@ def _resolve_math_online_eval_config(config: TrainConfig) -> dict:
         args = EvalConfig(
             **values, task=task, ckpt_path=config.model_path,
             model_family=config.model_family, output=spec["output_dir"],
-
+            sdar_denoising_steps=block // rate if config.model_family == "sdar" else 4,
         )
         args.validate()
     return spec

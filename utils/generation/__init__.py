@@ -1,1 +1,1 @@
-'LLaDA model and evaluation support.'
+"""Diffusion, RePara block, and native SDAR generation."""

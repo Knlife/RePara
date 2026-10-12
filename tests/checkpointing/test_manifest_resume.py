@@ -394,7 +394,17 @@ class ResumeSemanticsTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "train_schedule"):
             self.validate(train_schedule=[schedule[0], schedule[1] | {"start_step": 6}])
 
-
+    def test_sdar_native_block_size_must_match(self):
+        self.manifest["effective_config"].update(
+            model_family="sdar", sdar_native_block_size=32
+        )
+        self.write_manifest()
+        self.assertEqual(
+            self.validate(model_family="sdar", sdar_native_block_size=32).completed_steps,
+            5,
+        )
+        with self.assertRaisesRegex(ValueError, "sdar_native_block_size"):
+            self.validate(model_family="sdar", sdar_native_block_size=4)
 
     def test_configuration_and_dependency_mismatches_are_rejected(self):
         with self.assertRaisesRegex(ValueError, "config mismatch for method"):

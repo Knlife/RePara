@@ -14,7 +14,7 @@ from utils.models.forward import (
     select_logit_positions,
 )
 from utils.generation.generate import (
-
+    _generate_sdar_fixed_blocks_cached,
     generate,
     generate_monotonic_blocks,
 )
@@ -45,13 +45,50 @@ class ToyLLaDA(nn.Module):
         return self.model(input_ids)
 
 
+class ToySDAR(nn.Module):
+    def __init__(self, vocab_size=13, hidden_size=7):
+        super().__init__()
+        self.config = SimpleNamespace(block_size=2, fuse_cross_entropy=True)
+        self.embedding = nn.Embedding(vocab_size, hidden_size)
+        self.lm_head = nn.Linear(hidden_size, vocab_size, bias=False)
+        self.forward_training_states = []
+        self.last_kwargs = None
+
+    def forward(self, input_ids, **kwargs):
+        self.forward_training_states.append(self.training)
+        self.last_kwargs = kwargs
+        if self.training:
+            raise AssertionError("SDAR native training branch should not be used for logits")
+        hidden = self.embedding(input_ids)
+        hidden = hidden + torch.tanh(hidden.mean(dim=1, keepdim=True))
+        return SimpleNamespace(logits=self.lm_head(hidden))
 
 
+class PositionOnlyToySDAR(nn.Module):
+    def __init__(self, vocab_size=17):
+        super().__init__()
+        self.config = SimpleNamespace(block_size=2, fuse_cross_entropy=True)
+        self.vocab_size = vocab_size
+        self.calls = []
+
+    def forward(self, input_ids, **kwargs):
+        self.calls.append(kwargs)
+        position_ids = kwargs["position_ids"].expand(input_ids.shape[0], -1)
+        target_tokens = position_ids.remainder(self.vocab_size - 1)
+        logits = torch.zeros(
+            *input_ids.shape, self.vocab_size, device=input_ids.device
+        )
+        logits.scatter_(-1, target_tokens.unsqueeze(-1), 10.0)
+        return SimpleNamespace(logits=logits)
 
 
-
-
-
+class LowConfidenceToySDAR(PositionOnlyToySDAR):
+    def forward(self, input_ids, **kwargs):
+        self.calls.append(kwargs)
+        logits = torch.zeros(
+            *input_ids.shape, self.vocab_size, device=input_ids.device
+        )
+        return SimpleNamespace(logits=logits)
 
 
 class TailBiasedToyModel(nn.Module):
@@ -114,7 +151,31 @@ class SelectiveLogitsTest(unittest.TestCase):
         rows = torch.arange(input_ids.shape[0]).unsqueeze(1)
         torch.testing.assert_close(selected_logits, full_logits[rows, positions])
 
+    def test_sdar_output_matches_full_logits_and_uses_selected_projection(self):
+        model = ToySDAR()
+        model.train()
+        input_ids = torch.tensor([[1, 2, 3], [4, 5, 6]])
+        positions = torch.tensor([[0, 2], [1, 1]])
+        keys_before = list(model.state_dict())
+        weight_before = model.lm_head.weight
 
+        install_position_selective_output_head(model, model_family="sdar")
+        full_logits = forward_logits(model, input_ids, model_family="sdar")
+        selected_logits = forward_selected_logits(
+            model, input_ids, positions, model_family="sdar",
+        )
+
+        rows = torch.arange(input_ids.shape[0]).unsqueeze(1)
+        torch.testing.assert_close(selected_logits, full_logits[rows, positions])
+        self.assertTrue(model.training)
+        self.assertEqual(model.forward_training_states, [False, False])
+        self.assertEqual(keys_before, list(model.state_dict()))
+        self.assertIs(weight_before, model.lm_head.weight)
+
+        selected_indices = (rows.expand_as(positions).reshape(-1), positions.reshape(-1))
+        with select_logit_positions(selected_indices):
+            compact_logits = forward_logits(model, input_ids, model_family="sdar")
+        self.assertEqual(tuple(compact_logits.shape), (positions.numel(), 13))
 
     def test_rollout_matches_greedy_reference(self):
         reference = ToyLLaDA(vocab_size=17)
@@ -227,7 +288,25 @@ class SelectiveLogitsTest(unittest.TestCase):
 
         torch.testing.assert_close(actual[:, -2:], torch.full((2, 2), 3))
 
+    def test_sdar_cached_mtp_masks_tokens_outside_sampling_vocab(self):
+        model = TailBiasedToyModel()
+        prompt = torch.empty((2, 0), dtype=torch.long)
 
+        actual = generate_monotonic_blocks(
+            model,
+            prompt,
+            gen_length=4,
+            max_block_size=2,
+            schedule="fixed",
+            temperature=0.0,
+            mask_id=4,
+            model_family="sdar",
+            sampling_vocab_size=5,
+        )
+
+        torch.testing.assert_close(
+            actual["generated_ids"], torch.full((2, 4), 3)
+        )
 
     def test_mtp_rollout_matches_full_logits(self):
         prompt = torch.tensor([[1, 2], [1, 2]])
@@ -273,21 +352,293 @@ class SelectiveLogitsTest(unittest.TestCase):
                 ):
                     torch.testing.assert_close(actual["rollout_stats"][key], expected["rollout_stats"][key])
 
+    def test_sdar_mtp_rollout_respects_native_block_boundaries(self):
+        model = ToySDAR(vocab_size=17)
+        model.config.block_size = 2
+        model.eval()
+        prompt = torch.tensor([[1], [1]])
 
+        actual = generate_monotonic_blocks(
+            model,
+            prompt,
+            gen_length=4,
+            max_block_size=2,
+            schedule="fixed",
+            temperature=0.0,
+            mask_id=16,
+            model_family="sdar",
+        )
 
+        torch.testing.assert_close(
+            actual["block_starts"],
+            torch.tensor([[0, 1, 3, -1], [0, 1, 3, -1]]),
+        )
+        torch.testing.assert_close(
+            actual["block_lengths"],
+            torch.tensor([[1, 2, 1, 0], [1, 2, 1, 0]]),
+        )
+        absolute_starts = prompt.shape[1] + actual["block_starts"]
+        active = actual["block_lengths"] > 0
+        self.assertTrue(
+            (
+                (absolute_starts[active] % model.config.block_size)
+                + actual["block_lengths"][active]
+                <= model.config.block_size
+            ).all()
+        )
 
+    def test_sdar_fixed_mtp_cached_rollout_matches_full_logits_path(self):
+        prompt = torch.tensor([[1], [1]])
+        reference = PositionOnlyToySDAR(vocab_size=17)
+        cached = PositionOnlyToySDAR(vocab_size=17)
 
+        expected = generate_monotonic_blocks(
+            reference,
+            prompt,
+            gen_length=4,
+            max_block_size=2,
+            schedule="fixed",
+            temperature=0.0,
+            mask_id=16,
+            model_family="sdar",
+            use_sdar_kv_cache=False,
+        )
+        actual = generate_monotonic_blocks(
+            cached,
+            prompt,
+            gen_length=4,
+            max_block_size=2,
+            schedule="fixed",
+            temperature=0.0,
+            mask_id=16,
+            model_family="sdar",
+        )
 
+        for key in ("generated_ids", "block_starts", "block_lengths", "num_blocks"):
+            torch.testing.assert_close(actual[key], expected[key])
+        for key in (
+            "length_counts", "forced_singletons", "confidence_sum",
+            "confidence_count", "forward_rounds",
+        ):
+            torch.testing.assert_close(
+                actual["rollout_stats"][key], expected["rollout_stats"][key]
+            )
+        self.assertTrue(any(call.get("store_kv") for call in cached.calls))
+        self.assertTrue(
+            any(call.get("past_key_values") is not None for call in cached.calls)
+        )
 
+    def test_sdar_adaptive_mtp_cached_rollout_matches_full_logits_path(self):
+        prompt = torch.tensor([[1], [1]])
+        reference = PositionOnlyToySDAR(vocab_size=17)
+        cached = PositionOnlyToySDAR(vocab_size=17)
 
+        expected = generate_monotonic_blocks(
+            reference,
+            prompt,
+            gen_length=4,
+            max_block_size=2,
+            schedule="adaptive",
+            confidence_threshold=0.0,
+            temperature=1.0,
+            mask_id=16,
+            model_family="sdar",
+            generators=make_generators([101, 102], "cpu"),
+            use_sdar_kv_cache=False,
+        )
+        actual = generate_monotonic_blocks(
+            cached,
+            prompt,
+            gen_length=4,
+            max_block_size=2,
+            schedule="adaptive",
+            confidence_threshold=0.0,
+            temperature=1.0,
+            mask_id=16,
+            model_family="sdar",
+            generators=make_generators([101, 102], "cpu"),
+        )
 
+        for key in ("generated_ids", "block_starts", "block_lengths", "num_blocks"):
+            torch.testing.assert_close(actual[key], expected[key])
+        for key in (
+            "length_counts", "forced_singletons", "confidence_sum",
+            "confidence_count", "forward_rounds",
+        ):
+            torch.testing.assert_close(
+                actual["rollout_stats"][key], expected["rollout_stats"][key]
+            )
+        self.assertTrue(any(call.get("store_kv") for call in cached.calls))
+        self.assertTrue(
+            any(call.get("past_key_values") is not None for call in cached.calls)
+        )
 
+    def test_sdar_adaptive_cached_rollout_records_forced_singletons(self):
+        prompt = torch.empty((2, 0), dtype=torch.long)
+        cached = LowConfidenceToySDAR(vocab_size=17)
 
+        actual = generate_monotonic_blocks(
+            cached,
+            prompt,
+            gen_length=3,
+            max_block_size=2,
+            schedule="adaptive",
+            confidence_threshold=0.95,
+            temperature=1.0,
+            mask_id=16,
+            model_family="sdar",
+            generators=make_generators([101, 102], "cpu"),
+        )
 
+        torch.testing.assert_close(
+            actual["block_lengths"],
+            torch.tensor([[1, 1, 1], [1, 1, 1]]),
+        )
+        torch.testing.assert_close(
+            actual["rollout_stats"]["length_counts"],
+            torch.tensor([6, 0]),
+        )
+        self.assertEqual(int(actual["rollout_stats"]["forced_singletons"]), 6)
+        self.assertEqual(int(actual["rollout_stats"]["confidence_count"]), 6)
 
+    def test_sdar_cached_rollout_aligns_global_forward_for_inactive_rank(self):
+        prompt = torch.empty((2, 0), dtype=torch.long)
+        cached = PositionOnlyToySDAR(vocab_size=17)
+        reduce_calls = []
+        promotions = 0
 
+        def all_reduce(tensor, op=None):
+            nonlocal promotions
+            reduce_calls.append(int(tensor.item()))
+            if len(reduce_calls) == 1:
+                # All simulated ranks have empty prompts: no prefill forward.
+                return
+            if (
+                op == torch.distributed.ReduceOp.MAX
+                and int(tensor.item()) == 0
+                and promotions < 2
+            ):
+                tensor.fill_(1)
+                promotions += 1
 
+        with (
+            mock.patch.object(torch.distributed, "is_available", return_value=True),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "all_reduce", side_effect=all_reduce),
+        ):
+            generate_monotonic_blocks(
+                cached,
+                prompt,
+                gen_length=1,
+                max_block_size=1,
+                schedule="fixed",
+                temperature=0.0,
+                mask_id=16,
+                model_family="sdar",
+                synchronize_forward_rounds=True,
+            )
 
+        self.assertGreaterEqual(reduce_calls.count(0), 3)
+        self.assertTrue(cached.calls[-1].get("store_kv") is False)
+        self.assertIsNone(cached.calls[-1].get("past_key_values"))
+
+    def test_sdar_cached_rollout_logs_after_inactive_rank_padding(self):
+        prompt = torch.empty((2, 0), dtype=torch.long)
+        cached = PositionOnlyToySDAR(vocab_size=17)
+        reduce_calls = []
+        promotions = 0
+
+        def all_reduce(tensor, op=None):
+            nonlocal promotions
+            reduce_calls.append((int(tensor.item()), op))
+            if len(reduce_calls) == 1:
+                # All simulated ranks have empty prompts: no prefill forward.
+                return
+            if (
+                op == torch.distributed.ReduceOp.MAX
+                and int(tensor.item()) == 0
+                and promotions < 2
+            ):
+                tensor.fill_(1)
+                promotions += 1
+
+        with (
+            mock.patch.object(torch.distributed, "is_available", return_value=True),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_rank", return_value=0),
+            mock.patch.object(torch.distributed, "all_reduce", side_effect=all_reduce),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            _generate_sdar_fixed_blocks_cached(
+                cached,
+                prompt,
+                gen_length=1,
+                max_block_size=1,
+                temperature=0.0,
+                mask_id=16,
+                generators=None,
+                synchronize_forward_rounds=True,
+                progress_interval=1,
+            )
+
+        reduce_ops = [op for _, op in reduce_calls]
+        self.assertIn(torch.distributed.ReduceOp.MIN, reduce_ops)
+        self.assertIn(torch.distributed.ReduceOp.MAX, reduce_ops)
+        self.assertGreaterEqual(print_mock.call_count, 2)
+        self.assertIn("round=2", print_mock.call_args_list[-1].args[0])
+
+    def test_sdar_cached_rollout_progress_log_uses_synchronized_range(self):
+        prompt = torch.empty((2, 0), dtype=torch.long)
+        cached = PositionOnlyToySDAR(vocab_size=17)
+        reduce_ops = []
+
+        def all_reduce(tensor, op=None):
+            reduce_ops.append(op)
+
+        with (
+            mock.patch.object(torch.distributed, "is_available", return_value=True),
+            mock.patch.object(torch.distributed, "is_initialized", return_value=True),
+            mock.patch.object(torch.distributed, "get_rank", return_value=0),
+            mock.patch.object(
+                torch.distributed, "all_reduce", side_effect=all_reduce
+            ),
+            mock.patch("builtins.print") as print_mock,
+        ):
+            generate_monotonic_blocks(
+                cached,
+                prompt,
+                gen_length=32,
+                max_block_size=1,
+                schedule="fixed",
+                temperature=0.0,
+                mask_id=16,
+                model_family="sdar",
+                synchronize_forward_rounds=True,
+            )
+
+        self.assertIn(torch.distributed.ReduceOp.MIN, reduce_ops)
+        self.assertIn(torch.distributed.ReduceOp.MAX, reduce_ops)
+        print_mock.assert_called_once()
+        self.assertIn("round=32", print_mock.call_args.args[0])
+        self.assertIn("generated=32-32/32", print_mock.call_args.args[0])
+
+    def test_sdar_mtp_block_size_cannot_exceed_native_block_size(self):
+        model = ToySDAR(vocab_size=17)
+        model.config.block_size = 2
+        model.eval()
+        prompt = torch.tensor([[1], [1]])
+
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            generate_monotonic_blocks(
+                model,
+                prompt,
+                gen_length=4,
+                max_block_size=3,
+                schedule="fixed",
+                temperature=0.0,
+                mask_id=16,
+                model_family="sdar",
+            )
 
     def test_loss_matches_k1_full_logits_gradient(self):
         reference = ToyLLaDA(vocab_size=13)

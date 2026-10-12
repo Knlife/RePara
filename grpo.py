@@ -23,7 +23,7 @@ def _record_timing(timing, name, *, replacing=None):
 
 
 def _should_synchronize_mtp_forward_rounds(schedule, model_family):
-    return schedule == "adaptive" or False
+    return schedule == "adaptive" or model_family == "sdar"
 
 
 def _logical_completion_generators(
@@ -489,6 +489,7 @@ def block_logprob_loss(
             x = reconstruct_block_states(
                 generated_ids, prompt_len, starts, mask_id=mask_id
             )
+            # Cached SDAR attends masked padding in its last native block.
             # Retain that context while scoring the real completion tokens.
             if padding_length:
                 x = F.pad(x, (0, padding_length), value=mask_id)

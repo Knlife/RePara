@@ -1,1 +1,1 @@
-'LLaDA model and evaluation support.'
+"""Model loading checks, forward adapters, and SDAR attention configuration."""

@@ -1,0 +1,3 @@
+[submodule "third-party/sdar"]
+	path = third-party/sdar
+	url = https://github.com/JetAstra/SDAR.git

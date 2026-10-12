@@ -47,7 +47,18 @@ class CodeEvaluationTest(TestCase):
             "forward_rounds": torch.tensor(2),
         }
 
-
+    def test_code_tasks_accept_fixed_and_adaptive_with_both_confidences(self):
+        for family in ("llada", "sdar"):
+            for task in ("humaneval", "mbpp", "code"):
+                for method in ("fixed_mtp", "ar_mtp"):
+                    for metric in ("normalized_entropy", "max_probability"):
+                        with self.subTest(family=family, task=task, method=method, metric=metric):
+                            self.config(
+                                "/run", task=task, model_family=family,
+                                generation_method=method, mtp_confidence=metric,
+                                mbpp_data_file="/mbpp.jsonl", mbpp_test_file="/mbpp_test.jsonl",
+                                code_data_file="/code.jsonl", selective_logits=True,
+                            ).validate()
 
     def test_padding_keeps_forward_calls_and_is_excluded_from_statistics(self):
         problems = {key: {"prompt": key} for key in ("a", "b", "c")}
@@ -94,7 +105,13 @@ class CodeEvaluationTest(TestCase):
                 self.assertEqual(tokens.tolist(), [[1, 2, 3, 3, 3, 3]])
                 self.assertEqual(stats["forced_singletons"].item(), 4)
 
-
+    def test_fixed_sdar_decode_requests_synchronized_forward_rounds(self):
+        args = self.config("/run", model_family="sdar")
+        rollout = {"generated_ids": torch.tensor([[1, 2]]), "rollout_stats": None}
+        with mock.patch.object(evaluator, "generate_monotonic_blocks", return_value=rollout) as generate:
+            evaluator.generate_eval(object(), torch.tensor([[1, 2]]), args)
+        self.assertTrue(generate.call_args.kwargs["synchronize_forward_rounds"])
+        self.assertEqual(generate.call_args.kwargs["temperature"], 0)
 
     def test_invalid_sampling_temperature_is_rejected(self):
         for value in (-1, float("nan"), float("inf"), True):

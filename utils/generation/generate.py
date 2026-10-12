@@ -156,10 +156,21 @@ def select_contiguous_prefix_length(confidence, valid_slots, threshold):
     return torch.maximum(prefix, torch.ones_like(prefix)).minimum(valid_slots)
 
 
+def _sdar_model_block_size(model):
+    config = _get_model_config(model)
+    block_size = getattr(config, "block_size", None) if config is not None else None
+    if block_size is None:
+        return 4
+    block_size = int(block_size)
+    if block_size < 1:
+        raise ValueError("SDAR model block_size must be at least 1")
+    return block_size
 
 
-
-
+def _remaining_slots_in_sdar_block(prompt_len, positions, block_size):
+    """Return how many generation slots fit before each row's native SDAR block boundary."""
+    absolute_positions = prompt_len + positions
+    return block_size - (absolute_positions % block_size)
 
 
 def _init_mtp_rollout_tracking(batch_size, gen_length, max_block_size, device):
@@ -240,7 +251,30 @@ def _global_position_range(positions, synchronize_forward_rounds):
     return int(position_min.item()), int(position_max.item())
 
 
+def _maybe_log_sdar_rollout_progress(
+    tracking,
+    *,
+    gen_length,
+    cached_until,
+    progress_interval,
+    synchronize_forward_rounds,
+):
+    if progress_interval <= 0:
+        return
+    rounds = tracking["forward_rounds"]
+    if rounds == 0 or rounds % progress_interval != 0:
+        return
 
+    position_min, position_max = _global_position_range(
+        tracking["positions"], synchronize_forward_rounds
+    )
+    if _distributed_rank() == 0:
+        print(
+            "SDAR cached rollout progress: "
+            f"round={rounds}, generated={position_min}-{position_max}/{gen_length}, "
+            f"cached_until={cached_until}",
+            flush=True,
+        )
 
 
 def _apply_mtp_acceptance(
@@ -318,16 +352,256 @@ def _apply_mtp_acceptance(
     return accepted_lengths
 
 
+def _sdar_block_attention_mask(total_length, block_size, device):
+    num_blocks = (total_length + block_size - 1) // block_size
+    block_mask = torch.tril(
+        torch.ones(num_blocks, num_blocks, device=device, dtype=torch.bool)
+    )
+    return (
+        block_mask.repeat_interleave(block_size, dim=0)
+        .repeat_interleave(block_size, dim=1)[:total_length, :total_length]
+        .unsqueeze(0)
+    )
 
 
+def _sdar_cached_logits(
+    model,
+    input_ids,
+    *,
+    attention_mask,
+    position_ids,
+    past_key_values=None,
+    store_kv=False,
+):
+    return model(
+        input_ids,
+        attention_mask=attention_mask,
+        position_ids=position_ids,
+        past_key_values=past_key_values,
+        use_cache=past_key_values is not None,
+        store_kv=store_kv,
+    ).logits
 
 
+def _generate_sdar_blocks_cached(
+    model,
+    prompt,
+    *,
+    gen_length,
+    max_block_size,
+    schedule,
+    confidence_metric,
+    confidence_threshold,
+    temperature,
+    mask_id,
+    sampling_vocab_size,
+    generators,
+    synchronize_forward_rounds,
+    progress_interval=32,
+):
+    batch_size, prompt_len = prompt.shape
+    device = prompt.device
+    generators = _materialize_generators(generators)
+    sdar_block_size = _sdar_model_block_size(model)
+    if max_block_size > sdar_block_size:
+        raise ValueError(
+            "SDAR MTP block size must not exceed the model's native "
+            f"block_size ({sdar_block_size}); got {max_block_size}"
+        )
+
+    total_real_length = prompt_len + gen_length
+    total_length = (
+        (total_real_length + sdar_block_size - 1) // sdar_block_size
+    ) * sdar_block_size
+    x = torch.full(
+        (batch_size, total_length), mask_id, dtype=torch.long, device=device
+    )
+    x[:, :prompt_len] = prompt
+
+    block_attention_mask = _sdar_block_attention_mask(
+        total_length, sdar_block_size, device
+    )
+    position_ids = torch.arange(total_length, device=device).unsqueeze(0)
+    past_key_values = DynamicCache()
+
+    prefill_length = (prompt_len // sdar_block_size) * sdar_block_size
+    cached_until = prefill_length
+    if _is_globally_true(
+        prefill_length > 0, synchronize_forward_rounds, device=device
+    ):
+        if prefill_length > 0:
+            _sdar_cached_logits(
+                model,
+                x[:, :prefill_length],
+                attention_mask=block_attention_mask[:, :prefill_length, :prefill_length],
+                position_ids=position_ids[:, :prefill_length],
+                past_key_values=past_key_values,
+                store_kv=True,
+            )
+        else:
+            # A short prompt has no complete native block to prefill. It must
+            # still enter the model's FSDP/DDP collectives when another rank
+            # prefills; do not populate or advance this rank's KV cache.
+            _sdar_cached_logits(
+                model,
+                x[:, :1],
+                attention_mask=block_attention_mask[:, :1, :1],
+                position_ids=position_ids[:, :1],
+                past_key_values=None,
+                store_kv=False,
+            )
+
+    tracking = _init_mtp_rollout_tracking(
+        batch_size, gen_length, max_block_size, device
+    )
+    offsets = torch.arange(max_block_size, device=device).unsqueeze(0)
+
+    while True:
+        positions = tracking["positions"]
+        local_active = positions < gen_length
+        if not _has_globally_active_rows(local_active, synchronize_forward_rounds):
+            break
+
+        native_block_start = cached_until
+        native_block_end = min(native_block_start + sdar_block_size, total_length)
+        local_in_block = local_active & (
+            prompt_len + positions < native_block_end
+        )
+        if not _is_globally_true(
+            local_in_block.any(), synchronize_forward_rounds, device=device
+        ):
+            _sdar_cached_logits(
+                model,
+                x[:, native_block_start:native_block_end],
+                attention_mask=block_attention_mask[
+                    :, native_block_start:native_block_end, :native_block_end
+                ],
+                position_ids=position_ids[:, native_block_start:native_block_end],
+                past_key_values=past_key_values,
+                store_kv=True,
+            )
+            cached_until = native_block_end
+            continue
+
+        if not local_in_block.any():
+            # Padding forward: keep FSDP/DDP collective ordering aligned after
+            # this rank has no rows inside the current native SDAR block.
+            _sdar_cached_logits(
+                model,
+                x[:, :1],
+                attention_mask=block_attention_mask[:, :1, :1],
+                position_ids=position_ids[:, :1],
+                past_key_values=None,
+                store_kv=False,
+            )
+            tracking["forward_rounds"] += 1
+        else:
+            cur_x = x[:, native_block_start:native_block_end]
+            logits = _sdar_cached_logits(
+                model,
+                cur_x,
+                attention_mask=block_attention_mask[
+                    :, native_block_start:native_block_end, :native_block_end
+                ],
+                position_ids=position_ids[:, native_block_start:native_block_end],
+                past_key_values=past_key_values,
+                store_kv=False,
+            )
+
+            candidate_positions = positions.unsqueeze(1) + offsets
+            valid_slots = (gen_length - positions).clamp(min=0, max=max_block_size)
+            boundary_slots = _remaining_slots_in_sdar_block(
+                prompt_len, positions, sdar_block_size
+            )
+            valid_slots = torch.minimum(valid_slots, boundary_slots)
+            valid_slots = torch.where(
+                local_in_block, valid_slots, torch.zeros_like(valid_slots)
+            )
+            safe_positions = candidate_positions.clamp(max=gen_length - 1)
+            local_positions = (
+                prompt_len + safe_positions - native_block_start
+            ).clamp(min=0, max=logits.shape[1] - 1)
+            batch_index = torch.arange(batch_size, device=device).unsqueeze(1)
+            sampling_logits = logits[batch_index, local_positions].clone()
+            _mask_invalid_sampling_logits(
+                sampling_logits,
+                mask_id=mask_id,
+                sampling_vocab_size=sampling_vocab_size,
+                mask_mask_id=True,
+            )
+
+            if schedule == "fixed":
+                accepted_lengths = valid_slots
+                candidate_confidence = None
+            else:
+                candidate_confidence = compute_mtp_confidence(
+                    sampling_logits,
+                    metric=confidence_metric,
+                    temperature=temperature,
+                )
+                accepted_lengths = select_contiguous_prefix_length(
+                    candidate_confidence, valid_slots, confidence_threshold,
+                )
+                first_failed = (
+                    local_in_block
+                    & (candidate_confidence[:, 0] < confidence_threshold)
+                )
+                tracking["forced_singletons"] += first_failed.sum()
+
+            _apply_mtp_acceptance(
+                x,
+                prompt_len=prompt_len,
+                tracking=tracking,
+                local_active=local_in_block,
+                candidate_positions=candidate_positions,
+                accepted_lengths=accepted_lengths,
+                sampling_logits=sampling_logits,
+                offsets=offsets,
+                temperature=temperature,
+                generators=generators,
+                candidate_confidence=candidate_confidence,
+                sample_active_only=True,
+            )
+
+        _maybe_log_sdar_rollout_progress(
+            tracking,
+            gen_length=gen_length,
+            cached_until=cached_until,
+            progress_interval=progress_interval,
+            synchronize_forward_rounds=synchronize_forward_rounds,
+        )
+
+    return _mtp_rollout_result(x, tracking, total_length=total_real_length)
 
 
-
-
-
-
+def _generate_sdar_fixed_blocks_cached(
+    model,
+    prompt,
+    *,
+    gen_length,
+    max_block_size,
+    temperature,
+    mask_id,
+    sampling_vocab_size=None,
+    generators,
+    synchronize_forward_rounds,
+    progress_interval=32,
+):
+    return _generate_sdar_blocks_cached(
+        model,
+        prompt,
+        gen_length=gen_length,
+        max_block_size=max_block_size,
+        schedule="fixed",
+        confidence_metric="normalized_entropy",
+        confidence_threshold=0.0,
+        temperature=temperature,
+        mask_id=mask_id,
+        sampling_vocab_size=sampling_vocab_size,
+        generators=generators,
+        synchronize_forward_rounds=synchronize_forward_rounds,
+        progress_interval=progress_interval,
+    )
 
 
 @torch.no_grad()
@@ -335,7 +609,7 @@ def generate_monotonic_blocks(model, prompt, gen_length=128, max_block_size=4, s
                               confidence_metric="normalized_entropy", confidence_threshold=0.8,
                               temperature=1.0, mask_id=126336, model_family="llada",
                               generators=None, synchronize_forward_rounds=False,
-                              selective_logits=False,
+                              selective_logits=False, use_sdar_kv_cache=True,
                               sampling_vocab_size=None):
     if max_block_size < 1:
         raise ValueError("max_block_size must be at least 1")
@@ -348,8 +622,29 @@ def generate_monotonic_blocks(model, prompt, gen_length=128, max_block_size=4, s
 
     batch_size, prompt_len = prompt.shape
     device = prompt.device
-
-
+    sdar_block_size = None
+    if model_family == "sdar":
+        sdar_block_size = _sdar_model_block_size(model)
+        if max_block_size > sdar_block_size:
+            raise ValueError(
+                "SDAR MTP block size must not exceed the model's native "
+                f"block_size ({sdar_block_size}); got {max_block_size}"
+            )
+        if use_sdar_kv_cache:
+            return _generate_sdar_blocks_cached(
+                model,
+                prompt,
+                gen_length=gen_length,
+                max_block_size=max_block_size,
+                schedule=schedule,
+                confidence_metric=confidence_metric,
+                confidence_threshold=confidence_threshold,
+                temperature=temperature,
+                mask_id=mask_id,
+                sampling_vocab_size=sampling_vocab_size,
+                generators=generators,
+                synchronize_forward_rounds=synchronize_forward_rounds,
+            )
     # Materialize iterables once because this stream is reused at every round.
     generators = _materialize_generators(generators)
     x = torch.full((batch_size, prompt_len + gen_length), mask_id, dtype=torch.long, device=device)
@@ -368,7 +663,11 @@ def generate_monotonic_blocks(model, prompt, gen_length=128, max_block_size=4, s
         offsets = torch.arange(max_block_size, device=device).unsqueeze(0)
         candidate_positions = positions.unsqueeze(1) + offsets
         valid_slots = (gen_length - positions).clamp(min=0, max=max_block_size)
-
+        if sdar_block_size is not None:
+            boundary_slots = _remaining_slots_in_sdar_block(
+                prompt_len, positions, sdar_block_size
+            )
+            valid_slots = torch.minimum(valid_slots, boundary_slots)
         safe_positions = candidate_positions.clamp(max=gen_length - 1)
         if selective_logits:
             candidate_logits = forward_selected_logits(

@@ -72,6 +72,10 @@ def _find_position_selective_output_head(model, model_family="llada"):
             output_head = getattr(transformer, "ff_out", None)
             if isinstance(output_head, nn.Linear):
                 return transformer, "ff_out", output_head
+        elif model_family == "sdar":
+            output_head = getattr(module, "lm_head", None)
+            if isinstance(output_head, nn.Linear):
+                return module, "lm_head", output_head
         else:
             raise ValueError(f"Selective logits do not support model_family={model_family!r}")
 
@@ -92,7 +96,8 @@ def install_position_selective_output_head(model, model_family="llada"):
     if found is None:
         if model_family == "llada":
             raise ValueError("Could not find LLaDA transformer.ff_out output projection")
-
+        if model_family == "sdar":
+            raise ValueError("Could not find SDAR lm_head output projection")
         raise ValueError(f"Could not find output projection for model_family={model_family!r}")
     parent, name, output_head = found
     if isinstance(output_head, PositionSelectiveLinear):
@@ -111,19 +116,75 @@ def _get_model_config(model):
     return None
 
 
+def _sdar_attention_mask(input_ids, block_size):
+    """Build SDAR's eval/generation block-causal mask for each batch row."""
+    batch_size, seq_len = input_ids.shape
+    token_blocks = torch.arange(seq_len, device=input_ids.device) // block_size
+    mask = token_blocks[:, None] >= token_blocks[None, :]
+    return mask.unsqueeze(0).unsqueeze(1).expand(batch_size, 1, -1, -1)
 
 
+@contextlib.contextmanager
+def _sdar_logits_forward_mode(model):
+    """Use SDAR's logits-producing forward path without dropping autograd.
 
+    SDARForCausalLM switches to its native diffusion-loss branch based on the
+    top-level module's ``training`` flag. Flip only that module flag so decoder
+    layers remain in train mode for dropout/gradient checkpointing.
+    """
+    if not isinstance(model, nn.Module):
+        yield
+        return
 
+    targets = [
+        module
+        for module in model.modules()
+        if hasattr(module, "prepare_for_bd_training")
+    ] or [model]
+    training_states = [
+        (module, module.training)
+        for module in targets
+        if getattr(module, "training", False)
+    ]
+    if not training_states:
+        yield
+        return
+
+    for module, _ in training_states:
+        module.training = False
+    try:
+        yield
+    finally:
+        for module, training in training_states:
+            module.training = training
 
 
 def forward_logits(model, input_ids, model_family="llada"):
-    outputs = model(input_ids)
+    if model_family == "sdar":
+        config = _get_model_config(model)
+        block_size = getattr(config, "block_size", None) or 4
+        # SDARForCausalLM.forward() switches to its native denoising-loss branch
+        # whenever self.training is true, and that branch requires labels and
+        # returns no logits. RePara/GRPO replay needs differentiable logits, so
+        # keep the normal wrapped call path but temporarily use the eval/logits
+        # branch. Autograd remains enabled because this is not a no_grad context.
+        with _sdar_logits_forward_mode(model):
+            outputs = model(
+                input_ids,
+                attention_mask=_sdar_attention_mask(input_ids, block_size),
+                position_ids=torch.arange(input_ids.shape[1], device=input_ids.device)
+                .unsqueeze(0)
+                .expand(input_ids.shape[0], -1),
+                use_cache=False,
+            )
+    else:
+        outputs = model(input_ids)
 
     logits = getattr(outputs, "logits", None)
     if logits is None:
         raise RuntimeError(
-            'LLaDA model and evaluation support.'
+            f"Model forward did not return logits for model_family={model_family!r}. "
+            "Use --model_family sdar for SDARForCausalLM checkpoints."
         )
     return logits
 

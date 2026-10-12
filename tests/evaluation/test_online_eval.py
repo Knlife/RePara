@@ -35,7 +35,26 @@ def config_for(directory, *, family="llada", dataset="gsm8k"):
 
 
 class OnlineEvalConfigTest(unittest.TestCase):
-
+    def test_all_four_model_dataset_combinations(self):
+        for family in ("llada", "sdar"):
+            for dataset in ("gsm8k", "math"):
+                with self.subTest(family=family, dataset=dataset):
+                    cfg = config_for("/runs/test", family=family, dataset=dataset)
+                    cfg.validate()
+                    runs = build_online_eval_runs(cfg, "/ckpt/16", 16, mask_id=99, eos_token_id=2)
+                    self.assertEqual([r.mtp_size for r in runs], [1, 2, 4])
+                    self.assertEqual([r.steps for r in runs], [256, 128, 64])
+                    self.assertEqual(len({r.output for r in runs}), 3)
+                    for r in runs:
+                        self.assertEqual(r.ckpt_path, "/ckpt/16")
+                        self.assertEqual(r.gen_length, 256)
+                        self.assertEqual(r._online_metadata["temperature"], 0)
+                        self.assertEqual(r.task, "math500" if dataset == "math" else "gsm8k")
+                    if family == "sdar":
+                        self.assertEqual([r.sdar_denoising_steps for r in runs], [4, 2, 1])
+                        self.assertTrue(all(r.sdar_remasking_strategy == "low_confidence_dynamic" for r in runs))
+                        self.assertTrue(all(r.sdar_confidence_threshold == 0.85 for r in runs))
+                        self.assertTrue(all(r.sdar_stopping_criteria_idx == [2] for r in runs))
 
     def test_schedule_and_final_checkpoint(self):
         cfg = config_for("/runs/test")
@@ -66,7 +85,13 @@ class OnlineEvalConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "tasks"):
             cfg.validate()
 
-
+    def test_invalid_rates_rejected(self):
+        for rates in ([], [1, 1], [True], [3], [0], [1.5], "1"):
+            with self.subTest(rates=rates):
+                cfg = config_for("/runs/test", family="sdar")
+                cfg.eval_config["mtp_size"] = rates
+                with self.assertRaises(ValueError):
+                    cfg.validate()
 
     def test_unresolved_nested_environment_rejected(self):
         cfg = config_for("/runs/test")
@@ -74,7 +99,12 @@ class OnlineEvalConfigTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Unresolved"):
             cfg.validate()
 
-
+    def test_no_remote_or_nonzero_temperature(self):
+        for key, value in (("allow_remote_files", True), ("sdar_temperature", 1), ("unknown", 1)):
+            cfg = config_for("/runs/test")
+            cfg.eval_config[key] = value
+            with self.assertRaises(ValueError):
+                cfg.validate()
 
     def test_missing_or_training_data_fails_preflight(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -115,7 +145,39 @@ class OnlineEvalRuntimeTest(unittest.TestCase):
                     raise RuntimeError("test")
             self.assertEqual(os.environ["ACCELERATE_USE_FSDP"], "true")
 
+    def test_one_checkpoint_load_three_results_and_summary(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cfg = config_for(directory, family="sdar")
+            Path(cfg.model_path).mkdir()
+            (Path(directory) / "test.parquet").touch()
+            model = SimpleNamespace(config=SimpleNamespace(mask_token_id=99))
+            tokenizer = TokenizerStub(eos_token_id=2)
+            calls = []
 
+            def evaluate(model, tokenizer, device, args):
+                from eval import save_log
+                self.assertFalse(torch.is_grad_enabled())
+                calls.append(args.sdar_denoising_steps)
+                result = {"accuracy": 0.5, "correct": 2, "total": 4}
+                save_log(args, result)
+                return result
+
+            with patch("utils.evaluation.online_eval._load_checkpoint_for_eval", return_value=(model, tokenizer)) as loader, patch("eval.eval_math", side_effect=evaluate):
+                results = run_online_evaluation(device="cpu", config=cfg, checkpoint_path=cfg.model_path, completed_step=16)
+            loader.assert_called_once()
+            self.assertEqual(calls, [4, 2, 1])
+            self.assertEqual(len(results), 3)
+            root = Path(directory) / "online-eval/gsm8k/step-000016"
+            summary = json.loads((root / "summary.json").read_text())
+            self.assertEqual(summary["checkpoint_path"], cfg.model_path)
+            logs = list(root.glob("diff*/*/evaluation_log.json"))
+            self.assertEqual(len(logs), 3)
+            for path in logs:
+                log = json.loads(path.read_text())
+                self.assertEqual(log["completed_step"], 16)
+                self.assertEqual(log["ckpt_path"], cfg.model_path)
+                self.assertEqual(log["temperature"], 0)
+                self.assertTrue((path.parent / "effective_config.yaml").exists())
 
     def test_loading_failure_is_not_silently_skipped(self):
         with tempfile.TemporaryDirectory() as directory:

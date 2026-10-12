@@ -1,4 +1,9 @@
-'LLaDA model and evaluation support.'
+"""Checkpoint-triggered math evaluation on the training job's existing GPUs.
+
+Selectively ported from feat/train-monitor c0101b9 (eval_every/eval_config,
+rank-error synchronization, RNG isolation, benchmark logging). Extended for
+rate sweeps and native SDAR decoding without forwarding through training FSDP.
+"""
 
 from contextlib import contextmanager
 from dataclasses import asdict, fields
@@ -48,13 +53,16 @@ def build_online_eval_runs(config, checkpoint_path, completed_step, *, mask_id=N
             task=task, ckpt_path=str(checkpoint_path), model_family=config.model_family,
             mask_id=mask_id, mtp_size=rate, output=str(step_dir / f"diff{rate}"),
         )
-
+        if config.model_family == "sdar":
+            values["sdar_denoising_steps"] = spec["sdar_block_length"] // rate
+            if values["sdar_stopping_criteria_idx"] is None and eos_token_id is not None:
+                values["sdar_stopping_criteria_idx"] = [eos_token_id]
         args = EvalConfig(**values)
         args.validate()
         args._online_metadata = {
             "completed_step": completed_step,
             "decoding_rate": rate,
-            "decoding_rate_is_nominal": False,
+            "decoding_rate_is_nominal": config.model_family == "sdar",
             "temperature": 0.0,
         }
         runs.append(args)
@@ -101,7 +109,14 @@ def _replicated_model_loading():
 
 @contextmanager
 def _llada_allocator_compat(model_family):
-    'LLaDA model and evaluation support.'
+    """Skip only the optional allocator warmup for legacy LLaDA without a TP plan.
+
+    Transformers 4.52.4 iterates model._tp_plan whenever distributed is already
+    initialized and the device map contains CUDA, even for a non-TP replica.
+    LLaDA's custom wrapper leaves that attribute as None. Weight loading and
+    device placement do not require warmup. Keep the real distributed state,
+    FSDP learner, and SDAR loading untouched, and restore the hook on failure.
+    """
     if model_family != "llada":
         yield
         return
@@ -125,9 +140,9 @@ def _load_checkpoint_for_eval(checkpoint_path, model_family, device):
     from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
     tokenizer = AutoTokenizer.from_pretrained(
-        checkpoint_path, trust_remote_code=True, local_files_only=True,
+        checkpoint_path, trust_remote_code=model_family != "sdar", local_files_only=True,
     )
-    model_cls = AutoModel
+    model_cls = AutoModelForCausalLM if model_family == "sdar" else AutoModel
     with _replicated_model_loading(), _llada_allocator_compat(model_family):
         model = model_cls.from_pretrained(
             checkpoint_path, trust_remote_code=True, local_files_only=True,
@@ -139,7 +154,14 @@ def _load_checkpoint_for_eval(checkpoint_path, model_family, device):
 
 
 def run_online_evaluation(*, device, config, checkpoint_path, completed_step):
-    'LLaDA model and evaluation support.'
+    """Load one inference replica per rank, run all rates, then free it.
+
+    Training weights/optimizer/data cursor are untouched. In particular, native
+    SDAR can early-stop independently across ranks without mismatched FSDP
+    collectives. Only benchmark-level synchronization is shared by the replicas.
+    A failed evaluation raises on every rank; the already-saved state remains
+    resumable, and train.py replays this checkpoint's evaluation on resumption.
+    """
     if not online_evaluation_due(config, completed_step):
         return {}
     from eval import (

@@ -1,4 +1,4 @@
-'LLaDA model and evaluation support.'
+"""CPU/Gloo regression: uneven shards, native SDAR early exits, rank failures."""
 
 from datetime import timedelta
 import json
@@ -73,7 +73,7 @@ def _worker(rank, directory, mode):
         world_size=2, timeout=timedelta(seconds=45),
     )
     try:
-        for family in ("llada", ):
+        for family in ("llada", "sdar"):
             cfg = TrainConfig(
                 model_path=f"{directory}/ckpt-000016", output_dir=f"{directory}/{family}",
                 model_family=family, gsm8k_data_path=f"{directory}/train.parquet",
@@ -125,7 +125,8 @@ class OnlineEvalDistributedTest(unittest.TestCase):
             if mode != "success":
                 self.assertFalse(list(Path(directory).rglob("summary.json")))
 
-
+    def test_uneven_shards_and_sdar_dynamic_early_exits(self):
+        self._run("success")
 
     def test_rank_local_load_failure_propagates(self):
         self._run("load_failure")

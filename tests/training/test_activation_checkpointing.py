@@ -31,7 +31,21 @@ class CheckpointController(nn.Module):
 
 
 class ActivationCheckpointingTest(unittest.TestCase):
+    def test_sdar_none_disables_and_whole_layer_enables_checkpointing(self):
+        class SDARController(nn.Module):
+            is_gradient_checkpointing = True
 
+            def gradient_checkpointing_enable(self):
+                self.is_gradient_checkpointing = True
+
+            def gradient_checkpointing_disable(self):
+                self.is_gradient_checkpointing = False
+
+        model = SDARController()
+        self.assertTrue(set_activation_checkpointing(model, None, model_family="sdar"))
+        self.assertFalse(model.is_gradient_checkpointing)
+        self.assertTrue(set_activation_checkpointing(model, "whole_layer", model_family="sdar"))
+        self.assertTrue(model.is_gradient_checkpointing)
 
     def test_none_reaches_wrapped_controllers(self):
         wrapper = nn.Module()

@@ -17,12 +17,15 @@ from datasets import load_dataset
 from utils.configuration.config import EvalConfig, load_config, snapshot_config
 import utils.runtime.distributed as train_dist
 from utils.models.forward import install_position_selective_output_head
-
+from utils.models.sdar_config import configure_sdar_native_block_size
 from utils.generation.generate import generate, generate_monotonic_blocks
 from utils.evaluation.grader import math_equal
 from utils.evaluation.parser import extract_answer
 
-
+from utils.generation.sdar_native_generate import (
+    block_diffusion_generate_with_stats,
+    init_sdar_mtp_stats,
+)
 
 
 def _raw_dist_ready():
@@ -149,7 +152,13 @@ def init_dist():
 def eval_setting_name(args):
     if args.generation_method == "diffusion":
         return f"{args.task}-diffusion-len{args.gen_length}-blk{args.block_length}-step{args.steps}"
-
+    if args.generation_method == "sdar_native":
+        threshold = str(args.sdar_confidence_threshold).replace(".", "p")
+        return (
+            f"{args.task}-sdar-native-len{args.gen_length}"
+            f"-blk{args.sdar_block_length}-denoise{args.sdar_denoising_steps}"
+            f"-{args.sdar_remasking_strategy}-thr{threshold}"
+        )
     threshold = str(args.mtp_threshold).replace(".", "p")
     return (
         f"{args.task}-{args.generation_method}-len{args.gen_length}"
@@ -211,7 +220,8 @@ def resolve_mask_id(args, model, tokenizer):
 
     if args.model_family == "llada":
         return 126336
-
+    if args.model_family == "sdar":
+        return 151669
 
     raise ValueError(
         f"Could not resolve mask token id for model_family={args.model_family!r}. "
@@ -236,7 +246,24 @@ def merge_lora(model, adapter_dir):
 
 
 def generate_eval(model, prompt_ids, args):
-
+    if args.generation_method == "sdar_native":
+        return block_diffusion_generate_with_stats(
+            model=model,
+            prompt={"input_ids": prompt_ids},
+            mask_id=args.mask_id,
+            gen_length=args.gen_length,
+            block_length=args.sdar_block_length,
+            denoising_steps=args.sdar_denoising_steps,
+            temperature=args.sdar_temperature,
+            top_k=args.sdar_top_k,
+            top_p=args.sdar_top_p,
+            remasking_strategy=args.sdar_remasking_strategy,
+            confidence_threshold=args.sdar_confidence_threshold,
+            eb_threshold=args.sdar_eb_threshold,
+            stopping_criteria_idx=args.sdar_stopping_criteria_idx,
+            mtp_like_prefix_size=args.mtp_like_prefix_size,
+            sampling_vocab_size=getattr(args, "_sampling_vocab_size", None),
+        )
 
     if args.generation_method == "diffusion":
         if args.report_diffusion_mtp_like_stats:
@@ -277,7 +304,8 @@ def generate_eval(model, prompt_ids, args):
 
 
 def init_mtp_stats(args, device):
-
+    if args.generation_method == "sdar_native":
+        return init_sdar_mtp_stats(args.sdar_block_length, device)
     if args.generation_method == "diffusion":
         if not args.report_diffusion_mtp_like_stats:
             return None
@@ -325,11 +353,25 @@ def finalize_mtp_stats(args, stats, total_samples):
             "diffusion_mtp_like/forward_rounds_per_sample": stats["forward_rounds"].item() / total_samples,
         }
 
-    prefix_metrics = {}
+    if args.generation_method == "sdar_native":
+        opportunities = stats["prefix_pair_opportunities"].clamp_min(1)
+        transfer_count = stats["prefix_transfer_count"].clamp_min(1)
+        total_samples = max(total_samples, 1)
+        prefix_metrics = {
+            "sdar_mtp_like/prefix_size": args.mtp_like_prefix_size,
+            "sdar_mtp_like/consecutive_prefix_count": int(stats["prefix_pair_count"].item()),
+            "sdar_mtp_like/consecutive_prefix_opportunities": int(stats["prefix_pair_opportunities"].item()),
+            "sdar_mtp_like/consecutive_prefix_fraction": (stats["prefix_pair_count"].float() / opportunities).item(),
+            "sdar_mtp_like/mean_prefix_transfer": (stats["prefix_transfer_sum"].float() / transfer_count).item(),
+            "sdar_mtp_like/forward_rounds_total": int(stats["forward_rounds"].item()),
+            "sdar_mtp_like/forward_rounds_per_sample": stats["forward_rounds"].item() / total_samples,
+        }
+    else:
+        prefix_metrics = {}
 
     length_counts = stats["length_counts"]
     total_blocks = length_counts.sum().clamp_min(1)
-    max_block_size = args.mtp_block_size
+    max_block_size = args.sdar_block_length if args.generation_method == "sdar_native" else args.mtp_block_size
     block_lengths = torch.arange(1, max_block_size + 1, device=length_counts.device)
     mean_block_length = (length_counts * block_lengths).sum().float() / total_blocks
     singleton_fraction = length_counts[0].float() / total_blocks
@@ -345,7 +387,7 @@ def finalize_mtp_stats(args, stats, total_samples):
         "mtp/forced_singletons_per_sample": stats["forced_singletons"].item() / total_samples,
     }
     metrics.update(prefix_metrics)
-    if args.generation_method in ("ar_mtp", ):
+    if args.generation_method in ("ar_mtp", "sdar_native"):
         metrics["mtp/confidence_mean"] = confidence_mean.item()
     for idx, value in enumerate(length_counts, start=1):
         metrics[f"mtp/block_length_{idx}_count"] = int(value.item())
@@ -828,11 +870,12 @@ def main():
             local_files_only = not args.allow_remote_files
             tokenizer = AutoTokenizer.from_pretrained(
                 args.ckpt_path,
-                trust_remote_code=(True),
+                trust_remote_code=(args.model_family != "sdar"),
                 local_files_only=local_files_only,
             )
-
-            model_cls = AutoModel
+            if args.sdar_stopping_criteria_idx is None and tokenizer.eos_token_id is not None:
+                args.sdar_stopping_criteria_idx = [tokenizer.eos_token_id]
+            model_cls = AutoModelForCausalLM if args.model_family == "sdar" else AutoModel
 
             if os.path.exists(os.path.join(args.ckpt_path, "adapter_config.json")):
                 adapter_base_path = resolve_adapter_base_path(args.ckpt_path)
@@ -850,7 +893,12 @@ def main():
                     torch_dtype=torch.bfloat16,
                     local_files_only=local_files_only,
                 )
-
+            if args.model_family == "sdar":
+                native_size = args.sdar_native_block_size
+                if native_size is None and getattr(model.config, "block_size", None) is None:
+                    if args.generation_method == "sdar_native":
+                        native_size = args.sdar_block_length
+                configure_sdar_native_block_size(model.config, native_size)
             if args.selective_logits:
                 install_position_selective_output_head(model, model_family=args.model_family)
             model.eval().requires_grad_(False).to(device)
@@ -864,7 +912,7 @@ def main():
         for run_index, run_args in enumerate(eval_runs, start=1):
             run_args.mask_id = args.mask_id
             run_args._sampling_vocab_size = len(tokenizer)
-
+            run_args.sdar_stopping_criteria_idx = args.sdar_stopping_criteria_idx
             run_args._config_path = config_path
             run_args._config_overrides = overrides
             torch.manual_seed(run_args.seed)

@@ -379,7 +379,7 @@ def validate_resume_checkpoint(
     format_reward_alpha: float = 1.0,
     save_model_only: bool = False,
     train_schedule: Optional[list[dict]] = None,
-
+    sdar_native_block_size: Optional[int] = None,
 ) -> ResumeCheckpoint:
     """Validate a complete state and derive its data cursor.
 
@@ -447,7 +447,7 @@ def validate_resume_checkpoint(
             "activation_checkpointing_strategy": activation_checkpointing_strategy,
             "dataset": dataset,
             "train_schedule": train_schedule,
-
+            "sdar_native_block_size": sdar_native_block_size,
             "save_model_only": save_model_only,
         }
         if dataset == "code":

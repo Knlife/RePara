@@ -31,7 +31,10 @@ class LLaDAEvalLoadingTest(unittest.TestCase):
                 self.assertEqual(modeling_utils.caching_allocator_warmup(model, {}, None), "called")
             original.assert_called_once_with(model, {}, None)
 
-
+    def test_sdar_hook_is_unchanged(self):
+        original = modeling_utils.caching_allocator_warmup
+        with _llada_allocator_compat("sdar"):
+            self.assertIs(modeling_utils.caching_allocator_warmup, original)
 
     def test_hook_restored_after_exception(self):
         original = modeling_utils.caching_allocator_warmup

@@ -212,7 +212,11 @@ class RolloutRngTest(unittest.TestCase):
             )
             self.assertGreater(all_reduce.call_count, 0)
 
-
+    def test_sdar_mtp_always_synchronizes_forward_rounds(self):
+        self.assertTrue(_should_synchronize_mtp_forward_rounds("fixed", "sdar"))
+        self.assertTrue(_should_synchronize_mtp_forward_rounds("adaptive", "sdar"))
+        self.assertTrue(_should_synchronize_mtp_forward_rounds("adaptive", "llada"))
+        self.assertFalse(_should_synchronize_mtp_forward_rounds("fixed", "llada"))
 
 
 

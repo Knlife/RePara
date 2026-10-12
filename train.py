@@ -31,7 +31,7 @@ from utils.configuration.config import (
     snapshot_config,
 )
 from utils.models.forward import install_position_selective_output_head
-
+from utils.models.sdar_config import configure_sdar_native_block_size
 from utils.models.model_paths import validate_local_model_path
 from utils.checkpointing.resume import (
     ResumeCheckpoint,
@@ -116,7 +116,16 @@ def _organize_prompt_rollouts(prompt_rollouts):
 
 def set_activation_checkpointing(model, strategy, *, model_family="llada"):
     """Configure the model's activation-checkpointing controllers."""
-
+    if model_family == "sdar":
+        action = getattr(
+            model,
+            "gradient_checkpointing_enable" if strategy else "gradient_checkpointing_disable",
+            None,
+        )
+        if callable(action):
+            action()
+            return True
+        return False
     changed = False
     for module in model.modules():
         setter = getattr(module, "set_activation_checkpointing", None)
@@ -1267,7 +1276,8 @@ def resolve_mask_id(config: TrainConfig, model, tokenizer):
 
     if config.model_family == "llada":
         return 126336
-
+    if config.model_family == "sdar":
+        return 151669
 
     raise ValueError(
         f"Could not resolve mask token id for model_family={config.model_family!r}. "
@@ -1602,7 +1612,7 @@ def train(
                     format_reward_alpha=config.format_reward_alpha,
                     save_model_only=config.save_model_only,
                     train_schedule=config.normalized_train_schedule(),
-
+                    sdar_native_block_size=config.sdar_native_block_size,
                 )
                 _validate_resume_output_dir(
                     config.output_dir,
@@ -1663,7 +1673,7 @@ def train(
     print(f"Loading model and tokenizer from {model_path}...")
     from transformers import AutoModel, AutoModelForCausalLM, AutoTokenizer
 
-    model_cls = AutoModel
+    model_cls = AutoModelForCausalLM if config.model_family == "sdar" else AutoModel
     model_path_error = None
     if rank == 0:
         try:
@@ -1678,10 +1688,21 @@ def train(
         trust_remote_code=True,
         torch_dtype=torch.bfloat16,
     )
-
+    if config.model_family == "sdar":
+        native_block_size = configure_sdar_native_block_size(
+            model.config, config.sdar_native_block_size
+        )
+        if rank == 0:
+            print(
+                f"SDAR native block size: {native_block_size}; "
+                f"RePara MTP block size: {config.mtp_block_size}",
+                flush=True,
+            )
     model.eval().to(device)
 
-
+    if config.model_family == "sdar":
+        if hasattr(model.config, "fuse_cross_entropy"):
+            model.config.fuse_cross_entropy = False
     activation_checkpointing_supported = set_activation_checkpointing(
         model, loss_checkpoint_strategy, model_family=config.model_family,
     )
