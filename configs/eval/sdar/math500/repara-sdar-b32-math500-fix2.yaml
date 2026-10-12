@@ -1,0 +1,19 @@
+eval:
+  task: math500
+  ckpt_path: models/SDAR-8B-Chat-b32
+  model_family: sdar
+  output: outputs/eval/repara-sdar-b32-math500-fix2
+  gen_length:
+  - 128
+  - 256
+  - 512
+  seed: 113
+  temperature: 0.0
+  allow_remote_files: false
+  math500_data_files: datasets/math500/test-*.parquet
+  generation_method: fixed_mtp
+  mtp_block_size: 2
+  mtp_confidence: normalized_entropy
+  mtp_threshold: 0.95
+  selective_logits: true
+  sdar_native_block_size: 32

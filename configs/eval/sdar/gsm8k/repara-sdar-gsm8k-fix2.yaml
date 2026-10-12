@@ -1,0 +1,18 @@
+eval:
+  task: gsm8k
+  ckpt_path: models/SDAR-8B-Chat
+  model_family: sdar
+  output: outputs/eval/repara-sdar-gsm8k-fix2
+  gen_length:
+  - 128
+  - 256
+  - 512
+  seed: 113
+  temperature: 0.0
+  allow_remote_files: false
+  gsm8k_data_files: datasets/gsm8k/main/test-*.parquet
+  generation_method: fixed_mtp
+  mtp_block_size: 2
+  mtp_confidence: normalized_entropy
+  mtp_threshold: 0.95
+  selective_logits: true

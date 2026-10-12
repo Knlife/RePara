@@ -1,0 +1,20 @@
+eval:
+  task: gsm8k
+  ckpt_path: models/SDAR-8B-Chat
+  model_family: sdar
+  output: outputs/eval/sdar-native-gsm8k-denoise4
+  gen_length:
+  - 128
+  - 256
+  - 512
+  seed: 113
+  temperature: 0.0
+  allow_remote_files: false
+  gsm8k_data_files: datasets/gsm8k/main/test-*.parquet
+  generation_method: sdar_native
+  sdar_block_length: 4
+  sdar_denoising_steps: 4
+  sdar_remasking_strategy: low_confidence_dynamic
+  sdar_confidence_threshold: 0.85
+  sdar_temperature: 0.0
+  sdar_stopping_criteria_idx: []

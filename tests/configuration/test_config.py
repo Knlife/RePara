@@ -36,11 +36,79 @@ REPOSITORY_ENVIRONMENT = {
 }
 
 class ConfigTest(unittest.TestCase):
+    def test_repository_train_matrix_matches_runtime_schema(self):
+        config_dir = Path(__file__).resolve().parents[2] / "configs/train"
+        expected_names = {
+            f"justgrpo-{family}-{dataset}.yaml"
+            for family in ("llada", "sdar")
+            for dataset in ("gsm8k", "math", "code")
+        } | {
+            f"repara-{family}-{dataset}-{variant}.yaml"
+            for family in ("llada", "sdar")
+            for dataset in ("gsm8k", "math", "code")
+            for variant in ("fix2", "adaptive095")
+        }
+        self.assertTrue(expected_names.issubset({p.name for p in config_dir.rglob("*.yaml")}))
+        allowed_keys = {field.name for field in fields(TrainConfig)}
+        self.assertFalse(any(name.startswith("lora") for name in allowed_keys))
+        with patch.dict(os.environ, REPOSITORY_ENVIRONMENT, clear=True):
+            for path in sorted(config_dir.rglob("*.yaml")):
+                with self.subTest(config=str(path.relative_to(config_dir))):
+                    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+                    self.assertLessEqual(set(payload["train"]), allowed_keys)
+                    config, _, _ = parse_train_args(["--config", str(path)])
+                    self.assertEqual(
+                        path.relative_to(config_dir).parts[:2],
+                        (config.model_family, config.dataset),
+                    )
+                    self.assertIn(config.method, ("justgrpo", "fixed_mtp", "ar_mtp"))
+                    self.assertIn(config.model_family, ("llada", "sdar"))
+                    self.assertEqual(config.eval_every, 0)
+                    for stage in config.resolved_train_schedule():
+                        self.assertIn(stage.method, ("justgrpo", "fixed_mtp", "ar_mtp"))
 
+    def test_repository_eval_matrix_covers_all_model_task_decoders(self):
+        config_dir = Path(__file__).resolve().parents[2] / "configs/eval"
+        allowed_keys = {field.name for field in fields(EvalConfig)}
+        protocols = set()
+        with patch.dict(os.environ, REPOSITORY_ENVIRONMENT, clear=True):
+            for path in sorted(config_dir.rglob("*.yaml")):
+                with self.subTest(config=str(path.relative_to(config_dir))):
+                    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+                    self.assertLessEqual(set(payload["eval"]), allowed_keys)
+                    config, _, _ = parse_eval_args(["--config", str(path)])
+                    self.assertEqual(
+                        path.relative_to(config_dir).parts[:2],
+                        (config.model_family, config.task),
+                    )
+                    runs = expand_eval_configs(config)
+                    protocols.add((config.model_family, config.task, config.generation_method))
+                    self.assertEqual({run.gen_length for run in runs}, {128, 256, 512})
+                    self.assertEqual(len({eval_setting_name(run) for run in runs}), len(runs))
+                    self.assertEqual(config.temperature, 0)
+                    if config.generation_method == "diffusion":
+                        self.assertEqual({run.mtp_size for run in runs}, {1, 2, 4, 8, 16})
+                    if config.generation_method == "sdar_native":
+                        self.assertEqual(config.sdar_temperature, 0)
+                        self.assertEqual(config.sdar_stopping_criteria_idx, [])
+        expected = {
+            (family, task, method)
+            for family in ("llada", "sdar")
+            for task in ("gsm8k", "math500", "humaneval", "mbpp")
+            for method in (("diffusion", "fixed_mtp", "ar_mtp") if family == "llada" else ("sdar_native", "fixed_mtp", "ar_mtp"))
+        }
+        self.assertEqual(protocols, expected)
 
-
-
-
+    def test_full_parameter_training_rejects_excluded_methods_and_fields(self):
+        for method in ("ar_mtp_mismatch", "sdar_native"):
+            config = TrainConfig(model_path="/model", output_dir="/run", gsm8k_data_path="/data", method=method)
+            with self.subTest(method=method), self.assertRaisesRegex(ValueError, "Unknown training method"):
+                config.validate()
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "train.yaml"
+            path.write_text("train:\n  model_path: /model\n  output_dir: /run\n  gsm8k_data_path: /data\n  lora: true\n")
+            with self.assertRaisesRegex(ValueError, "Unknown train config field"):
+                load_config(path, section="train", config_class=TrainConfig)
 
     def test_loads_one_strict_section(self):
         with tempfile.TemporaryDirectory() as directory:
